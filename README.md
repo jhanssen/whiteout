@@ -67,10 +67,12 @@ target_link_libraries(your_target PRIVATE whiteout)
 
 Run under `ctest --test-dir build`:
 
-- `whiteout_tests`: 77 unit tests plus 10 end-to-end fixtures that pipe
+- `whiteout_tests`: 82 unit tests plus 10 end-to-end fixtures that pipe
   whiteout output through real `node` and compare stdout.
-- `ts_blank_space_corpus`: runs ts-blank-space's 8 fixture cases through
-  whiteout with per-fixture classification.
+- `ts_blank_space_corpus`: runs ts-blank-space's fixture cases (plus
+  carved `-works` subsets for fixtures whose originals trip an unfixed
+  parse error or grammar ambiguity) through whiteout with per-fixture
+  classification.
 
 ## License
 

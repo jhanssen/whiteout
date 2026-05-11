@@ -38,7 +38,8 @@ wants to load `.ts` files directly.
     based length/newline/reparse, positional substring, reject, parse-error,
     UTF-8, ABI sanity) plus end-to-end fixtures under `tests/e2e/` that pipe
     whiteout output through real `node` and compare stdout.
-  - `ts_blank_space_corpus.c`: runs ts-blank-space's 8 fixture cases through
+  - `ts_blank_space_corpus.c`: runs ts-blank-space's 8 fixture cases plus
+    3 carved `-works` subsets (`a-works`, `b-works`, `asi-works`) through
     whiteout with per-fixture classification (byte-equal, reject, parse-
     error with diagnostic hint, documented divergence).
 - `examples/`:
@@ -133,8 +134,9 @@ rather than buried in later sections.
    They must be verified against a real corpus before any external promise
    is made.
 2. **Grammar coverage is verified for a curated 36-feature corpus and the
-   8-fixture ts-blank-space corpus, not for real-world TS code at scale.**
-   No DefinitelyTyped or application-codebase run has been performed.
+   ts-blank-space corpus (8 original fixtures plus 3 carved `-works`
+   subsets), not for real-world TS code at scale.** No DefinitelyTyped or
+   application-codebase run has been performed.
 3. **Known partial-support cases in the current grammar:**
    - `import("a").Outer<X>.Inner<Y>`: chained generics on import paths still
      errors. Simpler `import("a").Foo<Bar>` works.
@@ -144,12 +146,21 @@ rather than buried in later sections.
    - `(expr)<T>` instantiation expressions followed by a tagged template:
      tree-sitter parses `<T>` as binary `<` / `>` operators rather than
      `type_arguments`, so `<T>` is not blanked. Documented divergence vs
-     ts-blank-space.
-   - Class-body and statement-level constructs that combine `as` or
-     `satisfies` with an immediately-following `(`/`[`/`` ` `` on a new line
-     can produce parse errors (e.g. `class C { f = 1 as N\n["x"]() {} }`).
-     The error message includes a hint suggesting an explicit `;` to
-     disambiguate.
+     ts-blank-space; covered by the `b` fixture (full file is
+     `EXPECT_DIVERGES`, `b-works` excises line 84 to exercise the rest
+     byte-equal).
+   - Class-body constructs that combine `as` or `satisfies` with an
+     immediately-following `(`/`[`/`` ` `` on a new line whose right-hand
+     side does not fit as a `lookup_type` (e.g. a parenthesised parameter
+     list or call) produce a parse error (e.g.
+     `class C { f = 1 as N\n["x"]() {} }`). The error message includes a
+     hint suggesting an explicit `;` to disambiguate. The `asi` fixture
+     full file is `EXPECT_PARSE_ERR`; `asi-works` excises the class-ASI
+     method body to exercise the rest byte-equal.
+   - Optional parameter declarations with a comment between `?` and
+     `:type`, e.g. `(a? /*c*/: T)`, produce a parse error in tree-sitter.
+     The `a` fixture full file is `EXPECT_PARSE_ERR`; `a-works` excises
+     the offending line to exercise the rest byte-equal.
    - `tree-sitter-typescript` open issues #335, #320, #314, #317, #309 and
      others not investigated. May or may not affect whiteout.
 
@@ -235,11 +246,21 @@ are unaffected.
   a newline is `(`, `[`, or `` ` ``. TypeScript treats this as a statement
   boundary; without the `;` the emitted JS would form a call/index/tagged
   template that the TS author did not write.
-- After top-level statement-level type blanks (`interface_declaration`,
+- Inside an `as` / `satisfies` expression whose type is a `lookup_type` or
+  `array_type` and the type's `[` token sits on a different line than the
+  base type's start (e.g. `foo as T\n[0]`). Tree-sitter parses the
+  bracketed continuation as indexed-type access, swallowing it into the
+  type region; whiteout cuts the blank at the end of the base type,
+  inserts `;`, and leaves the runtime `[N]` intact.
+- After statement-level type blanks (`interface_declaration`,
   `type_alias_declaration`, `ambient_declaration`, and `export`-wrapped
   forms of these) when the previous significant character is not already
-  `;` or when forward chaining is possible. Comment runs are skipped on
-  both sides of the lookup.
+  `;`. Comment runs are skipped on both sides of the lookup. Matches
+  ts-blank-space's `blankStatement` rule.
+- After class-body strip-full members (`abstract`/`declare` fields,
+  abstract methods, index signatures, etc.) when the previous significant
+  character is not already `;`. The trailing `;` sibling that tree-sitter
+  keeps outside the member node is absorbed into the blank.
 - After class-member modifier blanks (`public ["x"] = 1`, etc.) when the
   member's name is a `[computed]` form, so the previous field's value does
   not chain into `[`.
@@ -392,11 +413,15 @@ Built (under `tests/`):
   it, comparing stdout against the fixture's expected output. Covers types,
   generics, `as`/`satisfies`, interface plus class, optional params,
   definite assignment, template literals, nested generics, type aliases.
-- `ts_blank_space_corpus`: runs ts-blank-space's 8 fixture cases through
-  whiteout with per-fixture classification (byte-equal vs reject vs parse-
-  error with hint vs documented divergence). The fixtures and their
-  expected outputs are copied verbatim from ts-blank-space under
-  `tests/ts-blank-space-corpus/` (Apache-2.0).
+- `ts_blank_space_corpus`: runs ts-blank-space's 8 original fixture cases
+  through whiteout, plus 3 carved `-works` subsets (`a-works`, `b-works`,
+  `asi-works`) that excise the lines the originals trip on so the rest
+  can be exercised byte-equal. Each fixture has a per-fixture
+  classification (byte-equal vs reject vs parse-error with hint vs
+  documented divergence). The original fixtures and their expected
+  outputs are copied verbatim from ts-blank-space under
+  `tests/ts-blank-space-corpus/` (Apache-2.0); the `-works` files are
+  derived from them.
 
 Built (under `examples/`, all use the vendored grammar directly without
 needing the library to exist):
