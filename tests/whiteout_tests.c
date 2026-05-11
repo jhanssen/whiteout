@@ -339,9 +339,12 @@ int main(void) {
             "let x = y!;",
             "let x = y ;");
 
-    t_exact("old type assertion",
-            "let x = <T>y;",
-            "let x =    y;");
+    t_reject("prefix type assertion rejected",
+             "let x = <T>y;",
+             WHITEOUT_ERR_UNSUPPORTED, 8);
+    t_reject("prefix type assertion in arrow body rejected",
+             "const f = () => <T>{ a: 1 };",
+             WHITEOUT_ERR_UNSUPPORTED, 16);
 
     t_exact("satisfies",
             "const x = { a: 1 } satisfies { a: number };",

@@ -22,7 +22,7 @@ struct Range { uint32_t start; uint32_t end; };
 
 class Transformer {
 public:
-    Transformer(const char *src, uint32_t /*len*/) : src_(src) {}
+    Transformer(const char *src, uint32_t len) : src_(src), len_(len) {}
 
     void walk(TSNode node);
 
@@ -30,6 +30,7 @@ public:
     uint32_t err_offset() const { return err_offset_; }
     const std::string &err_msg() const { return err_msg_; }
     std::vector<Range> take_blanks() { return std::move(blanks_); }
+    std::vector<uint32_t> take_semicolons() { return std::move(semicolons_); }
 
 private:
     void parse_error(TSNode node, const char *kind) {
@@ -47,6 +48,99 @@ private:
     void blank_node(TSNode n) { add(ts_node_start_byte(n), ts_node_end_byte(n)); }
     void add(uint32_t s, uint32_t e) { if (e > s) blanks_.push_back({s, e}); }
 
+    void mark_semi_in(uint32_t s, uint32_t e) {
+        for (uint32_t i = s; i < e && i < len_; ++i) {
+            if (src_[i] != '\n' && src_[i] != '\r') { semicolons_.push_back(i); return; }
+        }
+    }
+
+    uint32_t next_significant(uint32_t from) const {
+        uint32_t i = from;
+        while (i < len_) {
+            char c = src_[i];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') { i++; continue; }
+            if (c == '/' && i + 1 < len_) {
+                char n = src_[i + 1];
+                if (n == '/') {
+                    while (i < len_ && src_[i] != '\n') i++;
+                    continue;
+                }
+                if (n == '*') {
+                    i += 2;
+                    while (i + 1 < len_ && !(src_[i] == '*' && src_[i + 1] == '/')) i++;
+                    i = (i + 1 < len_) ? i + 2 : len_;
+                    continue;
+                }
+            }
+            return i;
+        }
+        return len_;
+    }
+
+    // ts-blank-space inserts `;` for any top-level type-only blank unless
+    // the previous significant content ends with `;` (or doesn't exist).
+    // Scan forward from the file start tracking comment state to find the
+    // last non-comment, non-whitespace character before `start_byte`.
+    char last_significant_char_before(uint32_t start_byte) const {
+        char last = 0;
+        bool in_block = false, in_line = false;
+        uint32_t limit = start_byte > len_ ? len_ : start_byte;
+        for (uint32_t i = 0; i < limit; ++i) {
+            char c = src_[i];
+            if (in_line) { if (c == '\n') in_line = false; continue; }
+            if (in_block) {
+                if (c == '*' && i + 1 < limit && src_[i + 1] == '/') { i++; in_block = false; }
+                continue;
+            }
+            if (c == '/' && i + 1 < limit) {
+                char n = src_[i + 1];
+                if (n == '/') { in_line = true; i++; continue; }
+                if (n == '*') { in_block = true; i++; continue; }
+            }
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') continue;
+            last = c;
+        }
+        return last;
+    }
+
+    bool needs_leading_semi_before(uint32_t start_byte) const {
+        char c = last_significant_char_before(start_byte);
+        return c != 0 && c != ';';
+    }
+
+    bool asi_hazard_at(uint32_t end_byte) const {
+        // Only a hazard if there's a newline between `end_byte` and the next
+        // significant char. Same-line `foo as T(args)` is a call in both
+        // TypeScript and tree-sitter; blanking preserves call semantics so
+        // no `;` is needed. Cross-line `foo as T\n(args)` is the case where
+        // TS terminates the statement while tree-sitter would chain.
+        bool saw_newline = false;
+        for (uint32_t i = end_byte; i < len_; ++i) {
+            char c = src_[i];
+            if (c == '\n' || c == '\r') { saw_newline = true; continue; }
+            if (c == ' ' || c == '\t' || c == '\f' || c == '\v') continue;
+            if (c == '/' && i + 1 < len_) {
+                char n = src_[i + 1];
+                if (n == '/') {
+                    while (i < len_ && src_[i] != '\n') i++;
+                    if (i < len_) saw_newline = true;
+                    continue;
+                }
+                if (n == '*') {
+                    i += 2;
+                    while (i + 1 < len_ && !(src_[i] == '*' && src_[i + 1] == '/')) {
+                        if (src_[i] == '\n') saw_newline = true;
+                        i++;
+                    }
+                    if (i + 1 < len_) i++;
+                    continue;
+                }
+            }
+            return saw_newline && (c == '(' || c == '[' || c == '`');
+        }
+        return false;
+    }
+
     static string_view tname(TSNode n) { return string_view(ts_node_type(n)); }
 
     bool is_strip_full(string_view t) const {
@@ -57,9 +151,6 @@ private:
             || t == "asserts_annotation"
             || t == "type_parameters"
             || t == "type_arguments"
-            || t == "interface_declaration"
-            || t == "type_alias_declaration"
-            || t == "ambient_declaration"
             || t == "abstract_method_signature"
             || t == "method_signature"
             || t == "function_signature"
@@ -95,7 +186,9 @@ private:
     void walk_children_named(TSNode node);
 
     const char *src_;
+    uint32_t len_;
     std::vector<Range> blanks_;
+    std::vector<uint32_t> semicolons_;
     whiteout_status status_ = WHITEOUT_OK;
     uint32_t err_offset_ = 0;
     std::string err_msg_;
@@ -122,8 +215,62 @@ void Transformer::walk(TSNode node) {
     if (t == "internal_module")    { reject(node, "namespace is not supported (runtime-emitting)"); return; }
     if (t == "module")             { reject(node, "module is not supported (runtime-emitting)"); return; }
     if (t == "import_alias")       { reject(node, "import = is not supported (runtime-emitting)"); return; }
+    if (t == "type_assertion") {
+        reject(node, "prefix `<T>x` type assertion is not supported; use `x as T` instead");
+        return;
+    }
 
-    if (is_strip_full(t)) { blank_node(node); return; }
+    // Statement-level type-only declarations: blanking creates an empty span
+    // where a statement used to be. Insert `;` if either:
+    //   - the previous significant content does not already end with `;`
+    //     (matches ts-blank-space's defensive ASI behavior), or
+    //   - the next significant token would chain via JS ASI (`(`/`[`/`` ` ``).
+    if (t == "interface_declaration"
+        || t == "type_alias_declaration"
+        || t == "ambient_declaration") {
+        uint32_t s = ts_node_start_byte(node);
+        uint32_t e = ts_node_end_byte(node);
+        blank_node(node);
+        if (needs_leading_semi_before(s) || asi_hazard_at(e)) mark_semi_in(s, e);
+        return;
+    }
+
+    if (is_strip_full(t)) {
+        uint32_t s = ts_node_start_byte(node);
+        uint32_t e = ts_node_end_byte(node);
+        blank_node(node);
+        // Inside a class body, a strip-full node (e.g. `abstract_method_signature`)
+        // leaves a gap that the previous field's expression value could chain
+        // with the next member's `[computed]` name. Same hazard pattern as the
+        // `as`/`satisfies` cases.
+        TSNode parent = ts_node_parent(node);
+        if (!ts_node_is_null(parent) && tname(parent) == "class_body"
+            && asi_hazard_at(e)) {
+            mark_semi_in(s, e);
+        }
+        return;
+    }
+
+    if (t == "arrow_function") {
+        TSNode tp = ts_node_child_by_field_name(node, "type_parameters", 15);
+        if (!ts_node_is_null(tp)) {
+            TSPoint sp = ts_node_start_point(tp), ep = ts_node_end_point(tp);
+            if (sp.row != ep.row) {
+                reject(tp, "multi-line type parameters on an arrow function would separate `(` from the preceding context across lines");
+                return;
+            }
+        }
+        TSNode rt = ts_node_child_by_field_name(node, "return_type", 11);
+        if (!ts_node_is_null(rt)) {
+            TSPoint sp = ts_node_start_point(rt), ep = ts_node_end_point(rt);
+            if (sp.row != ep.row) {
+                reject(rt, "multi-line return type on an arrow function would split `)` and `=>` across lines");
+                return;
+            }
+        }
+        walk_children_named(node);
+        return;
+    }
 
     if (t == "import_statement")        { walk_import_statement(node); return; }
     if (t == "export_statement")        { walk_export_statement(node); return; }
@@ -133,11 +280,36 @@ void Transformer::walk(TSNode node) {
     if (t == "public_field_definition") { walk_field(node); return; }
     if (t == "required_parameter" || t == "optional_parameter") { walk_parameter(node); return; }
 
+    if (t == "variable_declarator") {
+        // Strip `!` (definite-assignment) on `let`/`var`/`const` declarators
+        // — it sits between the identifier and the type annotation as an
+        // anonymous token and TS allows it on any variable, not just fields.
+        uint32_t cc = ts_node_child_count(node);
+        for (uint32_t i = 0; i < cc && status_ == WHITEOUT_OK; ++i) {
+            TSNode c = ts_node_child(node, i);
+            if (!ts_node_is_named(c) && tname(c) == "!") {
+                blank_node(c);
+            } else if (ts_node_is_named(c)) {
+                walk(c);
+            }
+        }
+        return;
+    }
+
     if (t == "as_expression" || t == "satisfies_expression") {
+        // Tree-sitter binds `foo as T\n(args)` as a single call expression
+        // (per JS spec ASI), while TypeScript's own parser treats the
+        // newline-then-`(`/`[`/`` ` `` as a statement boundary. To preserve
+        // TS's runtime semantics in the blanked output, insert `;` in the
+        // blanked `as T` range when the next significant character would
+        // otherwise chain into the expression.
         if (ts_node_named_child_count(node) >= 1) {
             TSNode expr = ts_node_named_child(node, 0);
             walk(expr);
-            add(ts_node_end_byte(expr), ts_node_end_byte(node));
+            uint32_t blank_start = ts_node_end_byte(expr);
+            uint32_t blank_end = ts_node_end_byte(node);
+            add(blank_start, blank_end);
+            if (asi_hazard_at(blank_end)) mark_semi_in(blank_start, blank_end);
         }
         return;
     }
@@ -149,18 +321,6 @@ void Transformer::walk(TSNode node) {
         }
         return;
     }
-    if (t == "type_assertion") {
-        // `<T>expr`: type_arguments first in source order, expression last.
-        uint32_t ncc = ts_node_named_child_count(node);
-        if (ncc >= 1) {
-            TSNode expr = ts_node_named_child(node, ncc - 1);
-            add(ts_node_start_byte(node), ts_node_start_byte(expr));
-            walk(expr);
-        } else {
-            blank_node(node);
-        }
-        return;
-    }
 
     walk_children_named(node);
 }
@@ -168,18 +328,43 @@ void Transformer::walk(TSNode node) {
 void Transformer::walk_parameter(TSNode node) {
     uint32_t cc = ts_node_child_count(node);
     bool has_pp_modifier = false;
+    bool is_this_param = false;
     for (uint32_t i = 0; i < cc; ++i) {
         TSNode c = ts_node_child(node, i);
         string_view ct = tname(c);
         if (ts_node_is_named(c)) {
             if (ct == "decorator") { reject(c, "decorators are not supported in v1"); return; }
             if (ct == "accessibility_modifier" || ct == "override_modifier") has_pp_modifier = true;
+            if (ct == "this") is_this_param = true;
         } else {
             if (ct == "readonly") has_pp_modifier = true;
         }
     }
     if (has_pp_modifier && inside_constructor_params(node)) {
         reject(node, "parameter properties are not supported in v1");
+        return;
+    }
+    if (is_this_param) {
+        // `function f(this: T, ...)` — the `this` parameter is purely TS, with
+        // no JS equivalent. Blank the whole parameter and a trailing comma if
+        // present so the remaining parameter list stays well-formed.
+        uint32_t s = ts_node_start_byte(node);
+        uint32_t e = ts_node_end_byte(node);
+        TSNode parent = ts_node_parent(node);
+        if (!ts_node_is_null(parent)) {
+            uint32_t pcc = ts_node_child_count(parent);
+            int idx = -1;
+            for (uint32_t i = 0; i < pcc; ++i) {
+                if (ts_node_eq(ts_node_child(parent, i), node)) { idx = (int)i; break; }
+            }
+            if (idx >= 0 && (uint32_t)(idx + 1) < pcc) {
+                TSNode next = ts_node_child(parent, (uint32_t)(idx + 1));
+                if (!ts_node_is_named(next) && tname(next) == ",") {
+                    e = ts_node_end_byte(next);
+                }
+            }
+        }
+        add(s, e);
         return;
     }
     for (uint32_t i = 0; i < cc && status_ == WHITEOUT_OK; ++i) {
@@ -199,14 +384,21 @@ void Transformer::walk_parameter(TSNode node) {
 
 void Transformer::walk_field(TSNode node) {
     uint32_t cc = ts_node_child_count(node);
+
+    // `declare` or `abstract` on a class field: tsc emits no field for these.
+    // Blanking only the modifier would produce `class C { x; }` which under
+    // useDefineForClassFields creates an own property the author did not want.
     for (uint32_t i = 0; i < cc; ++i) {
         TSNode c = ts_node_child(node, i);
         if (!ts_node_is_named(c)) {
             string_view ct = tname(c);
-            // `declare` or `abstract` on a class field: tsc emits no field for these.
-            // Blanking only the modifier would produce `class C { x; }` which under
-            // useDefineForClassFields creates an own property the author did not want.
-            if (ct == "declare" || ct == "abstract") { blank_node(node); return; }
+            if (ct == "declare" || ct == "abstract") {
+                uint32_t s = ts_node_start_byte(node);
+                uint32_t e = ts_node_end_byte(node);
+                blank_node(node);
+                if (asi_hazard_at(e)) mark_semi_in(s, e);
+                return;
+            }
         }
     }
     for (uint32_t i = 0; i < cc; ++i) {
@@ -216,6 +408,25 @@ void Transformer::walk_field(TSNode node) {
             return;
         }
     }
+
+    // If the leftmost child is a TS-only modifier we are about to blank and
+    // the member's name is a `[computed]` form, mark `;` in the modifier's
+    // bytes. Otherwise the previous member's expression value can chain into
+    // `[` post-blanking (e.g. `f = 1` + `public ["x"]` → `f = 1["x"]`).
+    if (cc > 0) {
+        TSNode first = ts_node_child(node, 0);
+        string_view ft = tname(first);
+        bool first_is_ts_mod = ts_node_is_named(first)
+            ? (ft == "accessibility_modifier" || ft == "override_modifier")
+            : (ft == "readonly");
+        if (first_is_ts_mod) {
+            TSNode name = ts_node_child_by_field_name(node, "name", 4);
+            if (!ts_node_is_null(name) && tname(name) == "computed_property_name") {
+                mark_semi_in(ts_node_start_byte(first), ts_node_end_byte(first));
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < cc && status_ == WHITEOUT_OK; ++i) {
         TSNode c = ts_node_child(node, i);
         string_view ct = tname(c);
@@ -236,6 +447,21 @@ void Transformer::walk_field(TSNode node) {
 
 void Transformer::walk_method_definition(TSNode node) {
     uint32_t cc = ts_node_child_count(node);
+
+    if (cc > 0) {
+        TSNode first = ts_node_child(node, 0);
+        string_view ft = tname(first);
+        bool first_is_ts_mod = ts_node_is_named(first)
+            ? (ft == "accessibility_modifier" || ft == "override_modifier")
+            : (ft == "readonly" || ft == "abstract" || ft == "declare");
+        if (first_is_ts_mod) {
+            TSNode name = ts_node_child_by_field_name(node, "name", 4);
+            if (!ts_node_is_null(name) && tname(name) == "computed_property_name") {
+                mark_semi_in(ts_node_start_byte(first), ts_node_end_byte(first));
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < cc && status_ == WHITEOUT_OK; ++i) {
         TSNode c = ts_node_child(node, i);
         string_view ct = tname(c);
@@ -247,7 +473,8 @@ void Transformer::walk_method_definition(TSNode node) {
                 walk(c);
             }
         } else {
-            if (ct == "readonly" || ct == "abstract" || ct == "declare") blank_node(c);
+            // `?` is the optional-method marker on a method_definition.
+            if (ct == "readonly" || ct == "abstract" || ct == "declare" || ct == "?") blank_node(c);
         }
     }
 }
@@ -271,7 +498,10 @@ void Transformer::walk_import_statement(TSNode node) {
     for (uint32_t i = 0; i < cc; ++i) {
         TSNode c = ts_node_child(node, i);
         if (!ts_node_is_named(c) && tname(c) == "type") {
+            uint32_t s = ts_node_start_byte(node);
+            uint32_t e = ts_node_end_byte(node);
             blank_node(node);
+            if (needs_leading_semi_before(s) || asi_hazard_at(e)) mark_semi_in(s, e);
             return;
         }
     }
@@ -297,8 +527,27 @@ void Transformer::walk_export_statement(TSNode node) {
     for (uint32_t i = 0; i < cc; ++i) {
         TSNode c = ts_node_child(node, i);
         if (!ts_node_is_named(c) && tname(c) == "type") {
+            uint32_t s = ts_node_start_byte(node);
+            uint32_t e = ts_node_end_byte(node);
             blank_node(node);
+            if (needs_leading_semi_before(s) || asi_hazard_at(e)) mark_semi_in(s, e);
             return;
+        }
+    }
+    // `export interface I {}`, `export type T = ...`, `export declare ...`
+    // — no runtime emit, blank the entire statement including `export`.
+    for (uint32_t i = 0; i < cc; ++i) {
+        TSNode c = ts_node_child(node, i);
+        if (ts_node_is_named(c)) {
+            string_view ct = tname(c);
+            if (ct == "type_alias_declaration" || ct == "interface_declaration"
+                || ct == "ambient_declaration") {
+                uint32_t s = ts_node_start_byte(node);
+                uint32_t e = ts_node_end_byte(node);
+                blank_node(node);
+                if (needs_leading_semi_before(s) || asi_hazard_at(e)) mark_semi_in(s, e);
+                return;
+            }
         }
     }
     walk_children_named(node);
@@ -316,30 +565,45 @@ void Transformer::walk_specifier(TSNode spec) {
     }
     if (!has_type) return;
 
-    TSNode parent = ts_node_parent(spec);
+    // Scan the source for the adjacent comma, skipping whitespace and
+    // comments — those can sit between the specifier and the `,` in the
+    // input (e.g. `import { type X/**/, Y }`).
     uint32_t s = ts_node_start_byte(spec);
     uint32_t e = ts_node_end_byte(spec);
-    if (!ts_node_is_null(parent)) {
-        uint32_t pcc = ts_node_child_count(parent);
-        int idx = -1;
-        for (uint32_t i = 0; i < pcc; ++i) {
-            if (ts_node_eq(ts_node_child(parent, i), spec)) { idx = static_cast<int>(i); break; }
+
+    bool took_trailing = false;
+    uint32_t i = e;
+    while (i < len_) {
+        char c = src_[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') { i++; continue; }
+        if (c == '/' && i + 1 < len_) {
+            char n = src_[i + 1];
+            if (n == '/') { while (i < len_ && src_[i] != '\n') i++; continue; }
+            if (n == '*') {
+                i += 2;
+                while (i + 1 < len_ && !(src_[i] == '*' && src_[i + 1] == '/')) i++;
+                if (i + 1 < len_) i += 2; else i = len_;
+                continue;
+            }
         }
-        if (idx >= 0) {
-            bool took = false;
-            if (static_cast<uint32_t>(idx + 1) < pcc) {
-                TSNode tr = ts_node_child(parent, static_cast<uint32_t>(idx + 1));
-                if (!ts_node_is_named(tr) && tname(tr) == ",") {
-                    e = ts_node_end_byte(tr);
-                    took = true;
-                }
+        if (c == ',') { e = i + 1; took_trailing = true; }
+        break;
+    }
+    if (!took_trailing) {
+        // No trailing comma — sweep backwards for a leading comma (skipping
+        // whitespace/comments in the same way).
+        uint32_t j = s;
+        while (j > 0) {
+            char c = src_[j - 1];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') { j--; continue; }
+            if (j >= 2 && src_[j - 2] == '*' && src_[j - 1] == '/') {
+                j -= 2;
+                while (j > 0 && !(src_[j - 1] == '*' && j >= 2 && src_[j - 2] == '/')) j--;
+                if (j >= 2) j -= 2;
+                continue;
             }
-            if (!took && idx > 0) {
-                TSNode ld = ts_node_child(parent, static_cast<uint32_t>(idx - 1));
-                if (!ts_node_is_named(ld) && tname(ld) == ",") {
-                    s = ts_node_start_byte(ld);
-                }
-            }
+            if (c == ',') s = j - 1;
+            break;
         }
     }
     add(s, e);
@@ -438,6 +702,60 @@ bool find_first_parse_error(TSNode root, TSNode *bad, const char **kind) {
     return false;
 }
 
+void line_col_for_offset(const char *src, size_t len, size_t offset,
+                         size_t *line, size_t *col) {
+    size_t l = 1, c = 1;
+    size_t bound = offset < len ? offset : len;
+    for (size_t i = 0; i < bound; ++i) {
+        if (src[i] == '\n') { l++; c = 1; }
+        else { c++; }
+    }
+    *line = l; *col = c;
+}
+
+// Look at the bytes preceding `offset` (back to the previous newline, or up
+// to a small window) for an unparenthesised `as` or `satisfies` keyword on
+// the same logical line. Used to tailor parse-error messages.
+bool preceded_by_assertion_keyword(const char *src, size_t len, size_t offset) {
+    if (offset > len) offset = len;
+    size_t start = offset;
+    // Walk back to the previous newline, but cap the lookback so we don't
+    // scan an entire file.
+    size_t cap = (offset > 128) ? offset - 128 : 0;
+    while (start > cap && src[start - 1] != '\n') start--;
+    std::string_view window(src + start, offset - start);
+    auto contains_word = [&](std::string_view word) {
+        size_t pos = 0;
+        while ((pos = window.find(word, pos)) != std::string_view::npos) {
+            bool left_ok  = (pos == 0) || !(isalnum((unsigned char)window[pos - 1])
+                                            || window[pos - 1] == '_' || window[pos - 1] == '$');
+            size_t end = pos + word.size();
+            bool right_ok = (end == window.size())
+                            || !(isalnum((unsigned char)window[end])
+                                 || window[end] == '_' || window[end] == '$');
+            if (left_ok && right_ok) return true;
+            pos = end;
+        }
+        return false;
+    };
+    return contains_word("as") || contains_word("satisfies");
+}
+
+std::string format_parse_error(const char *src, size_t len, size_t offset,
+                               const char *kind) {
+    size_t line = 0, col = 0;
+    line_col_for_offset(src, len, offset, &line, &col);
+    std::string msg = "parse error at line " + std::to_string(line)
+                    + ":" + std::to_string(col) + ": " + kind;
+    if (preceded_by_assertion_keyword(src, len, offset)) {
+        msg += "; if the preceding `as` or `satisfies` expression is meant to "
+               "end here, add an explicit `;` before the newline "
+               "(tree-sitter's grammar binds the next `(`/`[` as a continuation, "
+               "unlike TypeScript's own parser)";
+    }
+    return msg;
+}
+
 } // namespace
 
 extern "C" whiteout_status whiteout_transform(
@@ -476,9 +794,9 @@ extern "C" whiteout_status whiteout_transform(
     TSNode bad_node{};
     const char *kind = "";
     if (find_first_parse_error(root, &bad_node, &kind)) {
+        size_t off = ts_node_start_byte(bad_node);
         set_err(ctx, err, WHITEOUT_ERR_PARSE,
-                std::string("parse error: ") + kind,
-                ts_node_start_byte(bad_node));
+                format_parse_error(src, src_len, off, kind), off);
         ts_tree_delete(tree);
         return WHITEOUT_ERR_PARSE;
     }
@@ -512,6 +830,9 @@ extern "C" whiteout_status whiteout_transform(
         for (uint32_t i = s; i < e; ++i) {
             if (buf[i] != '\n' && buf[i] != '\r') buf[i] = ' ';
         }
+    }
+    for (uint32_t pos : xf.take_semicolons()) {
+        if (pos < src_len && buf[pos] != '\n' && buf[pos] != '\r') buf[pos] = ';';
     }
 
     *out = buf;

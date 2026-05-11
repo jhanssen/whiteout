@@ -7,4 +7,11 @@ target_compile_definitions(whiteout_tests PRIVATE
 )
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/e2e)
 
+add_executable(ts_blank_space_corpus ts_blank_space_corpus.c)
+target_link_libraries(ts_blank_space_corpus PRIVATE whiteout)
+target_compile_definitions(ts_blank_space_corpus PRIVATE
+    WHITEOUT_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ts-blank-space-corpus"
+)
+
 add_test(NAME whiteout_tests COMMAND whiteout_tests)
+add_test(NAME ts_blank_space_corpus COMMAND ts_blank_space_corpus)
