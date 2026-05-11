@@ -33,6 +33,15 @@ whiteout_status whiteout_transform(
     char **out, size_t *out_len,
     whiteout_error *err);
 
+/* Transform `buf[0..len)` in place. The caller owns the buffer; do not pass
+ * it to whiteout_free. Same byte-equal-length and position-preservation
+ * guarantees as whiteout_transform. On any non-OK return, no bytes of the
+ * buffer have been modified. */
+whiteout_status whiteout_transform_inplace(
+    whiteout_ctx *ctx,
+    char *buf, size_t len,
+    whiteout_error *err);
+
 void whiteout_free(char *buf);
 
 #ifdef __cplusplus

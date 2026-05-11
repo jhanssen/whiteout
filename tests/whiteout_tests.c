@@ -646,6 +646,112 @@ int main(void) {
         }
     }
 
+    /* === in-place transform === */
+    {
+        /* For a sample of inputs, in-place output must match heap-allocated
+           output byte-for-byte. */
+        const char *cases[] = {
+            "let x: number = 1;",
+            "function f<T>(x: T): T { return x; }",
+            "import { A, type B, C } from \"x\";\nlet y = 0;\n",
+            "class C { x!: number; m(a?: T): void {} }",
+            "interface I { x: number }\nlet n = 1;\n",
+            "let z = (1 as number) + 2;",
+        };
+        size_t nc = sizeof cases / sizeof cases[0];
+        int ok = 1;
+        for (size_t i = 0; i < nc; ++i) {
+            size_t len = strlen(cases[i]);
+
+            char *expected_out = NULL; size_t expected_len = 0;
+            whiteout_error err1 = {0};
+            whiteout_status st1 = whiteout_transform(g_ctx, cases[i], len,
+                                                    &expected_out, &expected_len, &err1);
+            if (st1 != WHITEOUT_OK) {
+                fail_fmt("inplace[%zu]: baseline transform failed st=%d\n", i, (int)st1);
+                ok = 0;
+                continue;
+            }
+
+            char *buf = (char *)malloc(len);
+            if (!buf) { fail_fmt("inplace[%zu]: malloc failed\n", i); ok = 0; whiteout_free(expected_out); continue; }
+            memcpy(buf, cases[i], len);
+            whiteout_error err2 = {0};
+            whiteout_status st2 = whiteout_transform_inplace(g_ctx, buf, len, &err2);
+            if (st2 != WHITEOUT_OK) {
+                fail_fmt("inplace[%zu]: inplace transform failed st=%d\n", i, (int)st2);
+                ok = 0;
+            } else if (expected_len != len || memcmp(buf, expected_out, len) != 0) {
+                fail_fmt("inplace[%zu]: output mismatch\n", i);
+                ok = 0;
+            }
+            free(buf);
+            whiteout_free(expected_out);
+        }
+        if (ok) pass_msg("inplace matches heap-allocated transform");
+    }
+
+    /* On unsupported construct, inplace must leave buffer untouched. */
+    {
+        const char *src = "enum E { A, B }\n";
+        size_t len = strlen(src);
+        char *buf = (char *)malloc(len);
+        memcpy(buf, src, len);
+        whiteout_error err = {0};
+        whiteout_status st = whiteout_transform_inplace(g_ctx, buf, len, &err);
+        if (st != WHITEOUT_ERR_UNSUPPORTED) {
+            fail_fmt("inplace reject: status got=%d expected=UNSUPPORTED\n", (int)st);
+        } else if (memcmp(buf, src, len) != 0) {
+            fail_fmt("inplace reject: buffer was mutated on error\n");
+        } else {
+            pass_msg("inplace leaves buffer untouched on unsupported");
+        }
+        free(buf);
+    }
+
+    /* On parse error, inplace must leave buffer untouched. */
+    {
+        const char *src = "let x: = 1;";
+        size_t len = strlen(src);
+        char *buf = (char *)malloc(len);
+        memcpy(buf, src, len);
+        whiteout_error err = {0};
+        whiteout_status st = whiteout_transform_inplace(g_ctx, buf, len, &err);
+        if (st != WHITEOUT_ERR_PARSE) {
+            fail_fmt("inplace parse err: status got=%d expected=PARSE\n", (int)st);
+        } else if (memcmp(buf, src, len) != 0) {
+            fail_fmt("inplace parse err: buffer was mutated on error\n");
+        } else {
+            pass_msg("inplace leaves buffer untouched on parse error");
+        }
+        free(buf);
+    }
+
+    /* On invalid UTF-8, inplace must leave buffer untouched. */
+    {
+        char src[] = { 'l','e','t',' ','x',' ','=',' ','"',(char)0xFF,'"',';' };
+        size_t len = sizeof src;
+        char buf[sizeof src];
+        memcpy(buf, src, len);
+        whiteout_error err = {0};
+        whiteout_status st = whiteout_transform_inplace(g_ctx, buf, len, &err);
+        if (st != WHITEOUT_ERR_UTF8) {
+            fail_fmt("inplace utf8: status got=%d expected=UTF8\n", (int)st);
+        } else if (memcmp(buf, src, len) != 0) {
+            fail_fmt("inplace utf8: buffer was mutated on error\n");
+        } else {
+            pass_msg("inplace leaves buffer untouched on invalid UTF-8");
+        }
+    }
+
+    /* Null arg sanity. */
+    {
+        whiteout_error err = {0};
+        whiteout_status st = whiteout_transform_inplace(NULL, NULL, 0, &err);
+        if (st == WHITEOUT_ERR_INTERNAL) pass_msg("inplace null ctx rejected");
+        else fail_fmt("inplace null ctx: st=%d\n", (int)st);
+    }
+
     /* === end-to-end: run whiteout output through real node === */
     {
         const char *fixtures[] = {

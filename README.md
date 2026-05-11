@@ -37,6 +37,14 @@ if (st == WHITEOUT_OK) {
 whiteout_ctx_free(ctx);
 ```
 
+If you already own a writable buffer, you can transform it in place and skip
+the allocation:
+
+```c
+whiteout_status st = whiteout_transform_inplace(ctx, buf, len, &err);
+/* On success, buf has been mutated. On failure, buf is untouched. */
+```
+
 A single context is not thread-safe. Multiple contexts may be used
 concurrently from different threads.
 

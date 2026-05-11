@@ -961,26 +961,15 @@ std::string format_parse_error(const char *src, size_t len, size_t offset,
     return msg;
 }
 
-} // namespace
-
-extern "C" whiteout_status whiteout_transform(
+// Core pipeline: validate UTF-8, parse, walk, then mutate `dst` in place.
+// `dst` may alias `src`; all reads of `src` finish before any write to `dst`.
+// On any non-OK return, no bytes of `dst` have been written.
+whiteout_status do_transform(
     whiteout_ctx *ctx,
     const char *src, size_t src_len,
-    char **out, size_t *out_len,
+    char *dst,
     whiteout_error *err)
 {
-    if (out) *out = nullptr;
-    if (out_len) *out_len = 0;
-    if (err) { err->status = WHITEOUT_OK; err->message = ""; err->offset = 0; }
-    if (!ctx || !src || !out || !out_len) {
-        set_err(ctx, err, WHITEOUT_ERR_INTERNAL, "null argument", 0);
-        return WHITEOUT_ERR_INTERNAL;
-    }
-    if (src_len > UINT32_MAX) {
-        set_err(ctx, err, WHITEOUT_ERR_INTERNAL, "input too large", 0);
-        return WHITEOUT_ERR_INTERNAL;
-    }
-
     size_t bad = validate_utf8(src, src_len);
     if (bad != src_len) {
         set_err(ctx, err, WHITEOUT_ERR_UTF8, "invalid UTF-8", bad);
@@ -1018,13 +1007,9 @@ extern "C" whiteout_status whiteout_transform(
         return st;
     }
 
-    char *buf = static_cast<char *>(std::malloc(src_len));
-    if (!buf) {
-        set_err(ctx, err, WHITEOUT_ERR_ALLOC, "allocation failed", 0);
-        ts_tree_delete(tree);
-        return WHITEOUT_ERR_ALLOC;
-    }
-    std::memcpy(buf, src, src_len);
+    // Past here we mutate dst. The loops below only read dst; src is no longer
+    // touched, so dst aliasing src is safe.
+    if (dst != src) std::memcpy(dst, src, src_len);
 
     auto blanks = xf.take_blanks();
     std::sort(blanks.begin(), blanks.end(),
@@ -1033,18 +1018,70 @@ extern "C" whiteout_status whiteout_transform(
         uint32_t s = r.start;
         uint32_t e = r.end > src_len ? static_cast<uint32_t>(src_len) : r.end;
         for (uint32_t i = s; i < e; ++i) {
-            if (buf[i] != '\n' && buf[i] != '\r') buf[i] = ' ';
+            if (dst[i] != '\n' && dst[i] != '\r') dst[i] = ' ';
         }
     }
     for (uint32_t pos : xf.take_semicolons()) {
-        if (pos < src_len && buf[pos] != '\n' && buf[pos] != '\r') buf[pos] = ';';
+        if (pos < src_len && dst[pos] != '\n' && dst[pos] != '\r') dst[pos] = ';';
     }
     for (auto [pos, c] : xf.take_char_writes()) {
-        if (pos < src_len && buf[pos] != '\n' && buf[pos] != '\r') buf[pos] = c;
+        if (pos < src_len && dst[pos] != '\n' && dst[pos] != '\r') dst[pos] = c;
+    }
+
+    ts_tree_delete(tree);
+    return WHITEOUT_OK;
+}
+
+} // namespace
+
+extern "C" whiteout_status whiteout_transform(
+    whiteout_ctx *ctx,
+    const char *src, size_t src_len,
+    char **out, size_t *out_len,
+    whiteout_error *err)
+{
+    if (out) *out = nullptr;
+    if (out_len) *out_len = 0;
+    if (err) { err->status = WHITEOUT_OK; err->message = ""; err->offset = 0; }
+    if (!ctx || !src || !out || !out_len) {
+        set_err(ctx, err, WHITEOUT_ERR_INTERNAL, "null argument", 0);
+        return WHITEOUT_ERR_INTERNAL;
+    }
+    if (src_len > UINT32_MAX) {
+        set_err(ctx, err, WHITEOUT_ERR_INTERNAL, "input too large", 0);
+        return WHITEOUT_ERR_INTERNAL;
+    }
+
+    char *buf = static_cast<char *>(std::malloc(src_len ? src_len : 1));
+    if (!buf) {
+        set_err(ctx, err, WHITEOUT_ERR_ALLOC, "allocation failed", 0);
+        return WHITEOUT_ERR_ALLOC;
+    }
+
+    whiteout_status st = do_transform(ctx, src, src_len, buf, err);
+    if (st != WHITEOUT_OK) {
+        std::free(buf);
+        return st;
     }
 
     *out = buf;
     *out_len = src_len;
-    ts_tree_delete(tree);
     return WHITEOUT_OK;
+}
+
+extern "C" whiteout_status whiteout_transform_inplace(
+    whiteout_ctx *ctx,
+    char *buf, size_t len,
+    whiteout_error *err)
+{
+    if (err) { err->status = WHITEOUT_OK; err->message = ""; err->offset = 0; }
+    if (!ctx || (!buf && len > 0)) {
+        set_err(ctx, err, WHITEOUT_ERR_INTERNAL, "null argument", 0);
+        return WHITEOUT_ERR_INTERNAL;
+    }
+    if (len > UINT32_MAX) {
+        set_err(ctx, err, WHITEOUT_ERR_INTERNAL, "input too large", 0);
+        return WHITEOUT_ERR_INTERNAL;
+    }
+    return do_transform(ctx, buf, len, buf, err);
 }

@@ -191,6 +191,11 @@ rather than buried in later sections.
   input.
 - On error, output pointer is null and a structured error is returned (see
   Error model).
+- An in-place variant (`whiteout_transform_inplace`) mutates a caller-owned
+  buffer instead of allocating. The byte-equal-length invariant is what makes
+  this safe. On any non-OK return the buffer is left untouched: UTF-8
+  validation, parse-error scan, and the unsupported-construct walk all
+  complete before any byte is written.
 
 ### Stripped constructs (replaced with whitespace)
 The following are removed by overwriting their byte range with spaces (newlines
@@ -378,6 +383,16 @@ whiteout_status whiteout_transform(
     whiteout_ctx *ctx,
     const char *src, size_t src_len,
     char **out, size_t *out_len,
+    whiteout_error *err);
+
+// In-place variant. Mutates buf[0..len) directly; the caller owns the buffer
+// and must not pass it to whiteout_free. Same byte-equal-length and position-
+// preservation guarantees as whiteout_transform. On any non-OK return, no
+// bytes of the buffer have been written: validation, parse, and unsupported-
+// construct checks all run before mutation begins.
+whiteout_status whiteout_transform_inplace(
+    whiteout_ctx *ctx,
+    char *buf, size_t len,
     whiteout_error *err);
 
 void whiteout_free(char *buf);
