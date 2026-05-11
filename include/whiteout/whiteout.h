@@ -1,6 +1,11 @@
 #ifndef WHITEOUT_WHITEOUT_H
 #define WHITEOUT_WHITEOUT_H
 
+/* Sequential ABI version. Bumped on every release that changes anything
+ * a consumer can observe through this header. Use `#if WHITEOUT_VERSION >= N`
+ * to gate against a specific revision. */
+#define WHITEOUT_VERSION 1
+
 #include <stddef.h>
 
 #ifdef __cplusplus
