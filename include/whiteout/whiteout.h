@@ -1,0 +1,42 @@
+#ifndef WHITEOUT_WHITEOUT_H
+#define WHITEOUT_WHITEOUT_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct whiteout_ctx whiteout_ctx;
+
+typedef enum {
+    WHITEOUT_OK = 0,
+    WHITEOUT_ERR_PARSE,        /* ERROR or MISSING node in parse tree */
+    WHITEOUT_ERR_UNSUPPORTED,  /* rejected construct (enum, namespace, ...) */
+    WHITEOUT_ERR_ALLOC,        /* allocation failure */
+    WHITEOUT_ERR_UTF8,         /* input was not valid UTF-8 */
+    WHITEOUT_ERR_INTERNAL
+} whiteout_status;
+
+typedef struct {
+    whiteout_status status;
+    const char *message;
+    size_t offset;
+} whiteout_error;
+
+whiteout_ctx *whiteout_ctx_new(void);
+void whiteout_ctx_free(whiteout_ctx *ctx);
+
+whiteout_status whiteout_transform(
+    whiteout_ctx *ctx,
+    const char *src, size_t src_len,
+    char **out, size_t *out_len,
+    whiteout_error *err);
+
+void whiteout_free(char *buf);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

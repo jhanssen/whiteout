@@ -120,26 +120,15 @@ rather than buried in later sections.
 
 1. **No library code exists yet.** The C ABI in this document is a sketch.
    Building the library is the next major work item.
-2. **Decorators have no chosen default.** Stage-3 ECMAScript decorators have
-   runtime semantics (deterministic evaluation order, descriptor mutation);
-   treating them as type syntax and blanking them is incorrect. Legacy TS
-   decorators are a separate emit model again. v1 must either reject all
-   decorators or implement correct handling. Until this is decided, any TS
-   input containing a decorator has undefined behavior under this spec.
-3. **Performance and binary-size numbers in this document are budgets, not
+2. **Performance and binary-size numbers in this document are budgets, not
    commitments.** The 5 MB/s throughput target, the under-4×-input memory
    target, and the under-2 MB binary-size target have not been measured.
    They must be verified against a real corpus before any external promise
    is made.
-4. **Error-recovery policy is unset.** tree-sitter parses through errors and
-   produces ERROR nodes. The library must either treat any ERROR node in the
-   tree as a hard failure, or pass through and let the downstream JS engine
-   report the syntax error. The two choices have different debugging
-   ergonomics and both are defensible; one must be picked.
-5. **Grammar coverage is verified for a curated 36-feature corpus, not for
+3. **Grammar coverage is verified for a curated 36-feature corpus, not for
    real-world TS code.** No DefinitelyTyped or application-codebase run has
    been performed. Expect to discover additional grammar bugs when that runs.
-6. **Known partial-support cases in the current grammar:**
+4. **Known partial-support cases in the current grammar:**
    - `import("a").Outer<X>.Inner<Y>` — chained generics on import paths still
      errors. Simpler `import("a").Foo<Bar>` works.
    - Flow leftovers in the grammar (`?T`, `*`, `import typeof`) accept
@@ -180,17 +169,31 @@ rather than buried in later sections.
 The following are removed by overwriting their byte range with spaces (newlines
 preserved):
 - Type annotations on variables, parameters, return types, properties.
+- Optional markers (`?`) on parameters and class fields. The `?` is TS-only
+  syntax with no JS equivalent and must be blanked alongside the annotation.
+- Old-style type assertions `<T>x`. The `<T>` prefix is blanked; `x` is kept.
 - Type-only declarations: `interface`, `type` aliases.
 - Generic type parameters and type arguments: `<T>`, `<T extends U>`, `foo<T>()`,
   `new Foo<T>()`.
 - Type assertions: `x as Foo`, `x satisfies Foo`. The inner expression is kept.
 - Non-null assertions: `x!`. The `!` is blanked; `x` is kept.
 - `import type` / `export type` declarations and type-only specifiers within
-  regular import/export clauses.
+  regular import/export clauses. When a `type` specifier appears inside a
+  mixed clause (`import { A, type B, C } from "x"`), one adjacent comma is
+  also blanked so the resulting named-import list is well-formed JS.
 - Class member modifiers in type positions only: `readonly`, `override`,
-  `abstract`, `declare`, `public`/`private`/`protected` (when not part of a
-  parameter property — see Rejected).
-- Type-only `declare` statements at module scope.
+  `abstract`, `public`/`private`/`protected` (when not part of a parameter
+  property — see Rejected).
+- `declare`-prefixed and `abstract`-prefixed class field declarations are
+  blanked *in their entirety* (the whole field, not just the modifier).
+  Blanking only the modifier would produce `class C { x; }` which under
+  `useDefineForClassFields` defines an own property the TS author specifically
+  said not to create — `'x' in new C()` flips from `false` (under `tsc`) to
+  `true`. The same problem applies to `abstract` on a field: `tsc` emits no
+  field at all. Blanking the whole field preserves the original semantics for
+  both.
+- Type-only `declare` statements at module scope (`declare const`,
+  `declare function`, `declare module`, `declare global`, etc.).
 - `const` type parameter modifier (`<const T>`).
 - Variance modifiers `in`/`out` on type parameters.
 
@@ -199,11 +202,20 @@ The following are not stripped and not lowered. The library returns a
 structured error with byte offset:
 - `enum` declarations (including `const enum`).
 - `namespace` and `module` declarations with runtime emit.
-- Parameter properties: `constructor(public x: number)` etc.
+- Parameter properties: any constructor parameter carrying one or more of
+  `public`, `private`, `protected`, `readonly`, or `override`. Trigger rule
+  is the strict/simpler form: presence of any modifier in that set causes
+  rejection, even though `override`-alone is not actually a parameter
+  property under TS semantics. Revisit `override`-alone when (and if) the
+  post-v1 lowering API lands; it would then be blanked as a class-member
+  modifier in type position rather than rejected.
 - `import =` and `export =`.
-- Legacy TypeScript decorators when the decorator's runtime semantics differ
-  from the stage-3 ECMAScript decorator proposal. v1 may reject all decorators
-  pending a clearer decision.
+- Decorators. v1 rejects **all** decorators (`@foo`-prefixed forms on
+  classes, methods, accessors, properties, and parameters), regardless of
+  whether they would parse as legacy TS or stage-3 ECMAScript decorators.
+  Both have runtime semantics; blanking is incorrect for either. Pass-through
+  of stage-3 decorators may be considered post-v1 once a syntactic or
+  configuration-driven way to distinguish them from legacy is settled.
 
 The rejected list matches Node's `--experimental-strip-types` behavior so
 behavior is portable between Node and whiteout.
@@ -341,25 +353,28 @@ Planned (not yet built):
   surface grammar gaps that 36 hand-picked snippets cannot.
 - Benchmark suite kept under `bench/`, run on demand.
 
+## Decisions locked for v1
+
+- **Decorators**: reject all. See Rejected constructs.
+- **Error recovery**: hard failure. Any ERROR or MISSING node in the parse
+  tree causes `whiteout_transform` to return `WHITEOUT_ERR_PARSE` with the
+  byte offset of the first such node. No partial output is produced.
+- **JSX/TSX**: not in v1. The library exposes a TS-only entry point backed
+  by `tree_sitter_typescript`. `.tsx` input is not supported; a TSX entry
+  point may be added post-v1.
+- **Parameter properties**: rejected by the strict modifier-set rule. See
+  Rejected constructs.
+
 ## Open questions
 
-These are deferred and must be resolved before v1 release:
+These are deferred and do not block v1 implementation, but should be settled
+before or shortly after v1 release:
 
-1. **Decorators**: reject all in v1, or attempt to strip stage-3 decorators
-   while rejecting legacy TS decorators? Stage-3 decorators are runtime-bearing
-   in their evaluation order; treating them as type syntax is incorrect.
-2. **JSX/TSX**: do we want a separate entry point that accepts `.tsx` and
-   either rejects JSX or passes it through unchanged? Pass-through changes our
-   "JS source out" guarantee.
-3. **Error recovery**: do we surface ERROR-containing trees as parse failures,
-   or blank what we can and let the JS engine report the syntax error
-   downstream? The latter matches `ts-blank-space`'s behavior.
-4. **Grammar maintenance posture**: long-term, do we (a) keep cherry-picking
+1. **Grammar maintenance posture**: long-term, do we (a) keep cherry-picking
    from SegaraRai and upstream PRs, (b) become the de-facto active fork and
    accept contributions, or (c) plan a migration to whatever Microsoft's TS
    7.0 native compiler ships (no concrete plan yet for an embeddable parser).
-   No commitment needed for v1; mention because the choice shapes effort
-   beyond v1.
+   The choice shapes effort beyond v1.
 
 ## Out of scope / explicitly not committed
 
@@ -368,3 +383,14 @@ These are deferred and must be resolved before v1 release:
 - Sourcemap generation.
 - Plugin architecture, custom transforms.
 - Any feature that requires a type system.
+
+## Possible post-v1 directions (not committed)
+
+- **Opt-in lowering of runtime-bearing TS constructs** (parameter properties,
+  `enum`, `namespace`, and similar) via a separate entry point that emits a
+  source map. This would lower whatever the CST allows us to lower
+  mechanically, and reject the rest. It explicitly does **not** preserve the
+  v1 byte-equal-length / position-without-sourcemap guarantee — callers opt
+  into source maps in exchange for accepting more input. The current API and
+  its invariants stay unchanged; this would be an additional API, not a
+  replacement. No commitment to ship.
