@@ -1,0 +1,15 @@
+whiteout is licensed under the MIT license (see LICENSE).
+
+This project includes third-party material under separate terms:
+
+- tests/ts-blank-space-corpus/cases/ and tests/ts-blank-space-corpus/expected/
+  are copied verbatim from the ts-blank-space project
+  (https://github.com/bloomberg/ts-blank-space), which is licensed under the
+  Apache License, Version 2.0. See tests/ts-blank-space-corpus/LICENSE for
+  the full text.
+
+- 3rdparty/tree-sitter/ is the tree-sitter runtime, licensed under the MIT
+  license. See 3rdparty/tree-sitter/LICENSE.
+
+- 3rdparty/tree-sitter-typescript/ is a fork of tree-sitter-typescript,
+  licensed under the MIT license. See 3rdparty/tree-sitter-typescript/LICENSE.
