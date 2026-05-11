@@ -31,6 +31,7 @@ public:
     const std::string &err_msg() const { return err_msg_; }
     std::vector<Range> take_blanks() { return std::move(blanks_); }
     std::vector<uint32_t> take_semicolons() { return std::move(semicolons_); }
+    std::vector<std::pair<uint32_t, char>> take_char_writes() { return std::move(char_writes_); }
 
 private:
     void parse_error(TSNode node, const char *kind) {
@@ -47,6 +48,10 @@ private:
     }
     void blank_node(TSNode n) { add(ts_node_start_byte(n), ts_node_end_byte(n)); }
     void add(uint32_t s, uint32_t e) { if (e > s) blanks_.push_back({s, e}); }
+
+    void mark_char(uint32_t pos, char c) {
+        if (pos < len_) char_writes_.push_back({pos, c});
+    }
 
     void mark_semi_in(uint32_t s, uint32_t e) {
         for (uint32_t i = s; i < e && i < len_; ++i) {
@@ -106,6 +111,30 @@ private:
     bool needs_leading_semi_before(uint32_t start_byte) const {
         char c = last_significant_char_before(start_byte);
         return c != 0 && c != ';';
+    }
+
+    // If `node`'s parent is a `class_body` and the next sibling under that
+    // parent is an anonymous `;` token, return the end byte past the `;`.
+    // Otherwise return `default_end`. Used to extend strip-full blanking to
+    // absorb a class-member statement terminator that tree-sitter keeps as a
+    // sibling (TypeScript's AST includes the terminator inside the member
+    // node; matching that behavior makes whiteout's byte-output byte-equal
+    // with ts-blank-space).
+    uint32_t end_with_trailing_class_semi(TSNode node, uint32_t default_end) const {
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent)) return default_end;
+        if (tname(parent) != "class_body") return default_end;
+        uint32_t pcc = ts_node_child_count(parent);
+        int idx = -1;
+        for (uint32_t i = 0; i < pcc; ++i) {
+            if (ts_node_eq(ts_node_child(parent, i), node)) { idx = (int)i; break; }
+        }
+        if (idx < 0 || (uint32_t)(idx + 1) >= pcc) return default_end;
+        TSNode next = ts_node_child(parent, (uint32_t)(idx + 1));
+        if (!ts_node_is_named(next) && tname(next) == ";") {
+            return ts_node_end_byte(next);
+        }
+        return default_end;
     }
 
     bool asi_hazard_at(uint32_t end_byte) const {
@@ -189,6 +218,7 @@ private:
     uint32_t len_;
     std::vector<Range> blanks_;
     std::vector<uint32_t> semicolons_;
+    std::vector<std::pair<uint32_t, char>> char_writes_;
     whiteout_status status_ = WHITEOUT_OK;
     uint32_t err_offset_ = 0;
     std::string err_msg_;
@@ -231,43 +261,180 @@ void Transformer::walk(TSNode node) {
         uint32_t s = ts_node_start_byte(node);
         uint32_t e = ts_node_end_byte(node);
         blank_node(node);
-        if (needs_leading_semi_before(s) || asi_hazard_at(e)) mark_semi_in(s, e);
+        if (needs_leading_semi_before(s)) mark_semi_in(s, e);
         return;
     }
 
     if (is_strip_full(t)) {
         uint32_t s = ts_node_start_byte(node);
         uint32_t e = ts_node_end_byte(node);
-        blank_node(node);
-        // Inside a class body, a strip-full node (e.g. `abstract_method_signature`)
-        // leaves a gap that the previous field's expression value could chain
-        // with the next member's `[computed]` name. Same hazard pattern as the
-        // `as`/`satisfies` cases.
+        // Only class-body members participate in the `blankStatement` rule:
+        // extend the blank to absorb the trailing `;` sibling that
+        // tree-sitter keeps outside the member node, and prepend `;` when
+        // the previous statement-level content does not already end with
+        // `;`. For non-class-body strip-full nodes (e.g. `type_parameters`
+        // inside a function declaration), no semicolon shaping applies.
         TSNode parent = ts_node_parent(node);
-        if (!ts_node_is_null(parent) && tname(parent) == "class_body"
-            && asi_hazard_at(e)) {
-            mark_semi_in(s, e);
+        if (!ts_node_is_null(parent) && tname(parent) == "class_body") {
+            e = end_with_trailing_class_semi(node, e);
+            add(s, e);
+            if (needs_leading_semi_before(s)) mark_semi_in(s, e);
+        } else {
+            blank_node(node);
         }
         return;
     }
 
     if (t == "arrow_function") {
         TSNode tp = ts_node_child_by_field_name(node, "type_parameters", 15);
-        if (!ts_node_is_null(tp)) {
-            TSPoint sp = ts_node_start_point(tp), ep = ts_node_end_point(tp);
-            if (sp.row != ep.row) {
-                reject(tp, "multi-line type parameters on an arrow function would separate `(` from the preceding context across lines");
-                return;
-            }
-        }
         TSNode rt = ts_node_child_by_field_name(node, "return_type", 11);
-        if (!ts_node_is_null(rt)) {
-            TSPoint sp = ts_node_start_point(rt), ep = ts_node_end_point(rt);
-            if (sp.row != ep.row) {
-                reject(rt, "multi-line return type on an arrow function would split `)` and `=>` across lines");
-                return;
+        TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
+
+        // Locate the `=>` token early so we can use it both for the multi-line
+        // detection and the post-swap validity check.
+        TSNode arrow{};
+        bool have_arrow = false;
+        uint32_t cc_arrow = ts_node_child_count(node);
+        for (uint32_t i = 0; i < cc_arrow; ++i) {
+            TSNode c = ts_node_child(node, i);
+            if (!ts_node_is_named(c) && tname(c) == "=>") {
+                arrow = c;
+                have_arrow = true;
+                break;
             }
         }
+
+        auto contains_newline = [&](uint32_t a, uint32_t b) {
+            for (uint32_t i = a; i < b && i < len_; ++i) {
+                if (src_[i] == '\n' || src_[i] == '\r') return true;
+            }
+            return false;
+        };
+
+        // The swap is needed whenever blanking the type material would leave
+        // a newline between (preceding context) and `(`, or between `)` and
+        // `=>`. That happens when:
+        //   - type_parameters exists and a newline sits anywhere between its
+        //     start and the parameter list's `(`, or
+        //   - return_type exists and a newline sits between the parameter
+        //     list's `)` and `=>`.
+        bool tp_multi = false;
+        bool rt_multi = false;
+        if (!ts_node_is_null(tp) && !ts_node_is_null(params)) {
+            tp_multi = contains_newline(ts_node_start_byte(tp),
+                                        ts_node_start_byte(params) + 1);
+        }
+        if (!ts_node_is_null(rt) && !ts_node_is_null(params) && have_arrow) {
+            rt_multi = contains_newline(ts_node_end_byte(params),
+                                        ts_node_start_byte(arrow));
+        }
+
+        if (tp_multi || rt_multi) {
+            // The `(arglist) => body` rule in JS forbids a LineTerminator
+            // between `)` and `=>`. Naively blanking a multi-line type
+            // would leave a newline there, which is a syntax error.
+            //
+            // Fix: swap the type's outer delimiters with the parameter list's
+            // delimiters, byte-for-byte. The `<` of multi-line type parameters
+            // becomes `(`, the matching `>` of a multi-line return type becomes
+            // `)`, and the original `(`/`)` of the parameter list are blanked.
+            // Every retained identifier keeps its original column; only the
+            // parenthesis characters move.
+            if (ts_node_is_null(params)) {
+                reject(tp_multi ? tp : rt,
+                       "multi-line type on arrow function without `()` parameter list cannot be rewritten safely");
+                return;
+            }
+
+            if (!have_arrow) {
+                reject(node, "internal: arrow function without `=>` token");
+                return;
+            }
+            uint32_t params_start = ts_node_start_byte(params);
+            uint32_t params_end = ts_node_end_byte(params);
+
+            if (tp_multi) {
+                // `<` is at tp_start; rewrite it to `(`. Blank the type
+                // parameter list's body (the chars between `<` and `>`,
+                // plus the closing `>` itself) and the original `(` of the
+                // parameter list. Leave comments between `>` and `(` alone,
+                // matching ts-blank-space.
+                uint32_t tp_start = ts_node_start_byte(tp);
+                uint32_t tp_end = ts_node_end_byte(tp);
+                if (src_[tp_start] != '<') {
+                    reject(tp, "internal: type_parameters does not start with `<`");
+                    return;
+                }
+                mark_char(tp_start, '(');
+                add(tp_start + 1, tp_end);
+                add(params_start, params_start + 1);
+            }
+
+            if (rt_multi) {
+                uint32_t rt_start = ts_node_start_byte(rt);
+                uint32_t rt_end = ts_node_end_byte(rt);
+                uint32_t arrow_row = ts_node_start_point(arrow).row;
+
+                // Find the rightmost non-whitespace, non-comment byte inside
+                // return_type that sits on the same line as `=>`. That byte
+                // becomes `)` and the rest of return_type is blanked. If no
+                // such byte exists (return_type ends before the `=>` line
+                // with only whitespace/newlines between), we cannot keep `)`
+                // adjacent to `=>` and must reject.
+                uint32_t current_row = ts_node_start_point(rt).row;
+                bool in_line_c = false;
+                bool in_block_c = false;
+                uint32_t close_byte = UINT32_MAX;
+                for (uint32_t i = rt_start; i < rt_end; ++i) {
+                    char c = src_[i];
+                    if (in_line_c) {
+                        if (c == '\n') { in_line_c = false; current_row++; }
+                        continue;
+                    }
+                    if (in_block_c) {
+                        if (c == '*' && i + 1 < rt_end && src_[i + 1] == '/') {
+                            in_block_c = false; i++;
+                        } else if (c == '\n') {
+                            current_row++;
+                        }
+                        continue;
+                    }
+                    if (c == '\n') { current_row++; continue; }
+                    if (c == ' ' || c == '\t' || c == '\r') continue;
+                    if (c == '/' && i + 1 < rt_end) {
+                        if (src_[i + 1] == '/') { in_line_c = true; i++; continue; }
+                        if (src_[i + 1] == '*') { in_block_c = true; i++; continue; }
+                    }
+                    if (current_row == arrow_row) close_byte = i;
+                }
+                if (close_byte == UINT32_MAX) {
+                    reject(rt, "cannot place `)` adjacent to `=>`; the multi-line return type has no significant character on the same line as `=>`. Move some part of the return type onto the same line as `=>`, or rewrite the return type on a single line.");
+                    return;
+                }
+                // Blank the original `)`, any comments and whitespace
+                // between it and `:`, the return-type body, and trailing
+                // whitespace, leaving the swap byte as `)`. ts-blank-space
+                // erases comments between `)` and the return-type annotation
+                // (unlike the tp side where comments between `>` and `(`
+                // survive).
+                add(params_end - 1, close_byte);
+                mark_char(close_byte, ')');
+                add(close_byte + 1, rt_end);
+            }
+
+            // Walk the remaining children (the formal_parameters body to strip
+            // any annotations there, the arrow body, etc.). Skip the type
+            // parameters and return type, which we already handled.
+            for (uint32_t i = 0; i < cc_arrow && status_ == WHITEOUT_OK; ++i) {
+                TSNode c = ts_node_child(node, i);
+                if (!ts_node_is_named(c)) continue;
+                if (!ts_node_is_null(tp) && ts_node_eq(c, tp)) continue;
+                if (!ts_node_is_null(rt) && ts_node_eq(c, rt)) continue;
+                walk(c);
+            }
+            return;
+        }
+
         walk_children_named(node);
         return;
     }
@@ -308,6 +475,44 @@ void Transformer::walk(TSNode node) {
             walk(expr);
             uint32_t blank_start = ts_node_end_byte(expr);
             uint32_t blank_end = ts_node_end_byte(node);
+
+            // Asymmetric case: `foo as T\n[N]` is parsed as `as_expression`
+            // whose type is `lookup_type` or `array_type`, swallowing the
+            // `[N]` runtime continuation. Detect a `[` token within the type
+            // that sits on a different line than the type's start; cut the
+            // blank at the end of the base type (preserving any trailing
+            // comment before the newline) and force `;` insertion so the
+            // runtime `[N]` remains as a separate statement.
+            if (ts_node_named_child_count(node) >= 2) {
+                TSNode type = ts_node_named_child(node, 1);
+                string_view tt = tname(type);
+                if ((tt == "lookup_type" || tt == "array_type")
+                    && ts_node_named_child_count(type) >= 1) {
+                    TSNode base = ts_node_named_child(type, 0);
+                    uint32_t tcc = ts_node_child_count(type);
+                    for (uint32_t i = 0; i < tcc; ++i) {
+                        TSNode c = ts_node_child(type, i);
+                        if (!ts_node_is_named(c) && tname(c) == "[") {
+                            uint32_t br = ts_node_start_byte(c);
+                            bool newline = false;
+                            for (uint32_t j = ts_node_start_byte(type);
+                                 j < br && j < len_; ++j) {
+                                if (src_[j] == '\n' || src_[j] == '\r') {
+                                    newline = true; break;
+                                }
+                            }
+                            if (newline) {
+                                blank_end = ts_node_end_byte(base);
+                                add(blank_start, blank_end);
+                                mark_semi_in(blank_start, blank_end);
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
             add(blank_start, blank_end);
             if (asi_hazard_at(blank_end)) mark_semi_in(blank_start, blank_end);
         }
@@ -394,9 +599,9 @@ void Transformer::walk_field(TSNode node) {
             string_view ct = tname(c);
             if (ct == "declare" || ct == "abstract") {
                 uint32_t s = ts_node_start_byte(node);
-                uint32_t e = ts_node_end_byte(node);
-                blank_node(node);
-                if (asi_hazard_at(e)) mark_semi_in(s, e);
+                uint32_t e = end_with_trailing_class_semi(node, ts_node_end_byte(node));
+                add(s, e);
+                if (needs_leading_semi_before(s)) mark_semi_in(s, e);
                 return;
             }
         }
@@ -501,7 +706,7 @@ void Transformer::walk_import_statement(TSNode node) {
             uint32_t s = ts_node_start_byte(node);
             uint32_t e = ts_node_end_byte(node);
             blank_node(node);
-            if (needs_leading_semi_before(s) || asi_hazard_at(e)) mark_semi_in(s, e);
+            if (needs_leading_semi_before(s)) mark_semi_in(s, e);
             return;
         }
     }
@@ -530,7 +735,7 @@ void Transformer::walk_export_statement(TSNode node) {
             uint32_t s = ts_node_start_byte(node);
             uint32_t e = ts_node_end_byte(node);
             blank_node(node);
-            if (needs_leading_semi_before(s) || asi_hazard_at(e)) mark_semi_in(s, e);
+            if (needs_leading_semi_before(s)) mark_semi_in(s, e);
             return;
         }
     }
@@ -545,7 +750,7 @@ void Transformer::walk_export_statement(TSNode node) {
                 uint32_t s = ts_node_start_byte(node);
                 uint32_t e = ts_node_end_byte(node);
                 blank_node(node);
-                if (needs_leading_semi_before(s) || asi_hazard_at(e)) mark_semi_in(s, e);
+                if (needs_leading_semi_before(s)) mark_semi_in(s, e);
                 return;
             }
         }
@@ -833,6 +1038,9 @@ extern "C" whiteout_status whiteout_transform(
     }
     for (uint32_t pos : xf.take_semicolons()) {
         if (pos < src_len && buf[pos] != '\n' && buf[pos] != '\r') buf[pos] = ';';
+    }
+    for (auto [pos, c] : xf.take_char_writes()) {
+        if (pos < src_len && buf[pos] != '\n' && buf[pos] != '\r') buf[pos] = c;
     }
 
     *out = buf;

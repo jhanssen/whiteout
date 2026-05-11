@@ -442,6 +442,15 @@ int main(void) {
     t_property("accessor field preserved",
                "class C { accessor x = 1; }");
 
+    t_property("multi-line arrow return type",
+               "const f = (v: string): Array<\n   string\n> => [v];");
+    t_property("multi-line arrow type parameters",
+               "const f = async <\n   T\n>(v: T) => v;");
+    t_property("multi-line arrow both",
+               "const f = async <\n   T\n>(v: T): Promise<\n   T\n> => v;");
+    t_property("type params and params on different lines",
+               "(function () { return<T>\n  (v: T) => v });");
+
     t_property("multi-line interface",
                "interface I {\n  a: number;\n  b: string;\n}\n");
 
