@@ -1,0 +1,8 @@
+add_executable(ts_syntax_check ts_syntax_check.c)
+target_link_libraries(ts_syntax_check PRIVATE tree_sitter_typescript)
+
+add_executable(ts_shape_check ts_shape_check.c)
+target_link_libraries(ts_shape_check PRIVATE tree_sitter_typescript)
+
+add_executable(ts_full_dump ts_full_dump.c)
+target_link_libraries(ts_full_dump PRIVATE tree_sitter_typescript)

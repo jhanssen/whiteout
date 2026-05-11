@@ -1,0 +1,32 @@
+# Build output
+build/
+build-*/
+out/
+
+# CMake (in case anyone runs cmake outside build/)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+install_manifest.txt
+
+# LSP / indexer caches
+.cache/
+.clangd/
+.ccls-cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Tags
+tags
+TAGS
+GPATH
+GRTAGS
+GTAGS

@@ -1,0 +1,6 @@
+[submodule "3rdparty/tree-sitter"]
+	path = 3rdparty/tree-sitter
+	url = https://github.com/tree-sitter/tree-sitter
+[submodule "3rdparty/tree-sitter-typescript"]
+	path = 3rdparty/tree-sitter-typescript
+	url = https://github.com/jhanssen/tree-sitter-typescript
